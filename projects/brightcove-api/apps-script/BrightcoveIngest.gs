@@ -1,31 +1,68 @@
 /**
- * Uploads Google Drive images and native SRT files through Brightcove's
- * temporary S3 storage, then attaches them to an existing video.
+ * Separate Brightcove image and subtitle ingestion.
  *
- * Required OAuth permissions:
- * - Dynamic Ingest > Create
- * - Dynamic Ingest > Push Files (video-cloud/upload-urls/read)
- * - CMS > Video Read
+ * Reads the Drive source from column L and the Brightcove video ID from
+ * CONFIG.COLUMN_VIDEO_ID on the same row. This module is not called by Sync.
  */
 const BrightcoveIngest = (() => {
   const INGEST_BASE_URL =
     "https://ingest.api.brightcove.com/v1/accounts/";
   const DRIVE_LINK_COLUMN = 12; // Column L
+  const MAX_ASSET_BYTES = 45 * 1024 * 1024;
+  const LOCK_TIMEOUT_MS = 5000;
 
   let accessToken = null;
   let tokenExpiry = 0;
 
   /**
-   * Reads the video ID and Drive link from one row of the original sheet.
-   *
-   * Column L may contain a Drive folder link or a direct Drive file link.
-   * The Brightcove video ID is read from CONFIG.COLUMN_VIDEO_ID.
-   *
-   * Folder filename conventions:
-   * - poster.jpg, thumbnail.png, square.jpg, wide.jpg, etc.
-   * - captions_en.srt, captions_fr.srt, captions_en-GB.srt, etc.
+   * Validates and, unless dryRun is true, ingests assets for one sheet row.
    */
   function ingestAssetsForRow(rowNumber, options = {}) {
+    const plan = buildPlanForRow_(rowNumber);
+
+    if (options.dryRun) {
+      return summarisePlan_(plan, true);
+    }
+
+    const lock = LockService.getDocumentLock();
+
+    if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
+      throw new Error(
+        "Another asset ingest is already running. Try again when it finishes."
+      );
+    }
+
+    try {
+      const response = ingestSrtAndImages(
+        plan.videoId,
+        plan.images,
+        plan.srtFiles
+      );
+
+      return {
+        row: plan.row,
+        videoId: plan.videoId,
+        images: plan.images.map(asset => asset.file.getName()),
+        textTracks: plan.srtFiles.map(asset => ({
+          file: asset.file.getName(),
+          language: asset.srclang
+        })),
+        jobId: response.job_id || null,
+        response
+      };
+    } finally {
+      lock.releaseLock();
+    }
+  }
+
+  /**
+   * Performs all reads and validation without uploading or submitting ingest.
+   */
+  function dryRunAssetsForRow(rowNumber) {
+    return ingestAssetsForRow(rowNumber, { dryRun: true });
+  }
+
+  function buildPlanForRow_(rowNumber) {
     if (!Number.isInteger(rowNumber) || rowNumber <= CONFIG.HEADER_ROW) {
       throw new Error("A valid data row number is required.");
     }
@@ -50,69 +87,86 @@ const BrightcoveIngest = (() => {
     }
 
     if (!driveLink) {
-      throw new Error("Missing Google Drive link in column L on row " + rowNumber + ".");
+      throw new Error(
+        "Missing Google Drive link in column L on row " + rowNumber + "."
+      );
+    }
+
+    // This read verifies the video exists and gives us its real variants.
+    const video = BrightcoveApi.getVideo(videoId);
+
+    if (!video || !video.id) {
+      throw new Error("Brightcove video not found for row " + rowNumber + ".");
     }
 
     const files = getFilesFromDriveLink_(driveLink);
-    const assets = buildAssets_(files);
+    const allowedLanguages = getVideoLanguages_(video);
+    const assets = buildAssets_(files, allowedLanguages);
 
-    if (options.dryRun) {
-      return {
-        row: rowNumber,
-        videoId,
-        driveLink,
-        images: assets.images.map(asset => asset.file.getName()),
-        srtFiles: assets.srtFiles.map(asset => asset.file.getName()),
-        dryRun: true
-      };
+    if (!assets.images.length && !assets.srtFiles.length) {
+      throw new Error(
+        "No eligible thumbnail JPG/PNG or matched SRT files were found."
+      );
     }
 
-    return ingestSrtAndImages(videoId, assets.images, assets.srtFiles);
+    return {
+      row: rowNumber,
+      videoId: String(video.id),
+      driveLink,
+      allowedLanguages,
+      images: assets.images,
+      srtFiles: assets.srtFiles
+    };
+  }
+
+  function summarisePlan_(plan, dryRun) {
+    return {
+      row: plan.row,
+      videoId: plan.videoId,
+      driveLink: plan.driveLink,
+      allowedLanguages: plan.allowedLanguages.slice(),
+      images: plan.images.map(asset => ({
+        file: asset.file.getName(),
+        variant: "thumbnail",
+        bytes: asset.file.getSize()
+      })),
+      textTracks: plan.srtFiles.map(asset => ({
+        file: asset.file.getName(),
+        language: asset.srclang,
+        default: asset.default,
+        bytes: asset.file.getSize()
+      })),
+      dryRun: Boolean(dryRun),
+      writesPerformed: false
+    };
   }
 
   /**
-   * imageAssets:
-   * [{ file, variant: "poster", width: 1280, height: 720, language: "en" }]
-   *
-   * srtAssets:
-   * [{ file, srclang: "en", label: "English", kind: "subtitles",
-   *    default: true, status: "published" }]
+   * Lower-level entry point for already-resolved Drive files.
    */
   function ingestSrtAndImages(videoId, imageAssets, srtAssets) {
     if (!videoId) {
       throw new Error("A Brightcove video ID is required.");
     }
 
-    const images = (imageAssets || []).map(asset => {
-      validateImageAsset_(asset);
+    preflightAssets_(imageAssets || [], srtAssets || []);
 
-      const image = {
-        url: uploadFileToSource_(videoId, asset.file),
-        variant: asset.variant
-      };
+    const images = (imageAssets || []).map(asset => ({
+      url: uploadFileToSource_(videoId, asset.file),
+      variant: "thumbnail"
+    }));
 
-      if (asset.width != null) image.width = asset.width;
-      if (asset.height != null) image.height = asset.height;
-      if (asset.language) image.language = asset.language;
-
-      return image;
-    });
-
-    const textTracks = (srtAssets || []).map(asset => {
-      validateSrtAsset_(asset);
-
-      return {
-        url: uploadFileToSource_(videoId, asset.file),
-        srclang: asset.srclang,
-        kind: asset.kind || "subtitles",
-        label: asset.label || asset.srclang,
-        default: Boolean(asset.default),
-        status: asset.status || "published"
-      };
-    });
+    const textTracks = (srtAssets || []).map(asset => ({
+      url: uploadFileToSource_(videoId, asset.file),
+      srclang: asset.srclang,
+      kind: "subtitles",
+      label: asset.label || asset.srclang,
+      default: Boolean(asset.default),
+      status: "published"
+    }));
 
     if (!images.length && !textTracks.length) {
-      throw new Error("No supported images or SRT files were found.");
+      throw new Error("No assets were supplied for ingest.");
     }
 
     const payload = {};
@@ -126,39 +180,40 @@ const BrightcoveIngest = (() => {
     );
   }
 
-  function uploadImagesToVideo(videoId, imageAssets) {
-    return ingestSrtAndImages(videoId, imageAssets, []);
-  }
-
-  function uploadSrtToVideo(videoId, srtAssets) {
-    return ingestSrtAndImages(videoId, [], srtAssets);
-  }
-
   function getFilesFromDriveLink_(driveLink) {
     const id = extractDriveId_(driveLink);
     const files = [];
 
-    if (/\/folders\//i.test(driveLink)) {
-      const iterator = DriveApp.getFolderById(id).getFiles();
-
-      while (iterator.hasNext()) {
-        files.push(iterator.next());
+    try {
+      if (/\/folders\//i.test(driveLink)) {
+        collectFolderFiles_(DriveApp.getFolderById(id), files);
+      } else {
+        files.push(DriveApp.getFileById(id));
       }
-
-      return files;
+    } catch (firstError) {
+      try {
+        collectFolderFiles_(DriveApp.getFolderById(id), files);
+      } catch (folderError) {
+        throw new Error(
+          "Unable to open the Drive file or folder in column L. " +
+          "Check the link and Apps Script permissions. " +
+          folderError.message
+        );
+      }
     }
 
-    try {
-      files.push(DriveApp.getFileById(id));
-      return files;
-    } catch (fileError) {
-      const iterator = DriveApp.getFolderById(id).getFiles();
+    if (!files.length) {
+      throw new Error("The Drive folder linked in column L is empty.");
+    }
 
-      while (iterator.hasNext()) {
-        files.push(iterator.next());
-      }
+    return files;
+  }
 
-      return files;
+  function collectFolderFiles_(folder, files) {
+    const iterator = folder.getFiles();
+
+    while (iterator.hasNext()) {
+      files.push(iterator.next());
     }
   }
 
@@ -179,64 +234,160 @@ const BrightcoveIngest = (() => {
     throw new Error("Column L does not contain a recognised Google Drive link.");
   }
 
-  function buildAssets_(files) {
+  function getVideoLanguages_(video) {
+    const languages = [];
+    const masterLanguage = String(CONFIG.MASTER_LANGUAGE || "en").trim();
+
+    addUnique_(languages, masterLanguage);
+
+    const variants = BrightcoveApi.getVariants(video);
+
+    variants.forEach(variant => {
+      if (variant && variant.language) {
+        addUnique_(languages, String(variant.language).trim());
+      }
+    });
+
+    return languages;
+  }
+
+  function buildAssets_(files, allowedLanguages) {
     const images = [];
     const srtFiles = [];
-    const srtCandidates = [];
+    const languageFiles = {};
 
-    for (const file of files) {
+    files.forEach(file => {
       const name = file.getName();
-      const mimeType = file.getMimeType();
 
-      if (
-        /^image\//i.test(mimeType) ||
-        /\.(jpe?g|png|gif)$/i.test(name)
-      ) {
+      validateFileSize_(file);
+
+      // Only a JPG or PNG containing the full term "thumbnail" qualifies.
+      if (/thumbnail/i.test(name) && /\.(jpg|png)$/i.test(name)) {
         images.push({
           file,
-          variant: inferImageVariant_(name)
+          variant: "thumbnail"
         });
-      } else if (/\.srt$/i.test(name)) {
-        srtCandidates.push(file);
+        return;
       }
-    }
 
-    srtCandidates.forEach((file, index) => {
-      const language = inferLanguage_(file.getName());
+      if (!/\.srt$/i.test(name)) return;
 
+      const language = matchLanguageFromFilename_(name, allowedLanguages);
+
+      if (!language) {
+        throw new Error(
+          "SRT filename does not contain a language/region matching an " +
+          "existing video variant: " + name +
+          ". Expected one of: " + allowedLanguages.join(", ")
+        );
+      }
+
+      const key = language.toLowerCase();
+
+      if (languageFiles[key]) {
+        throw new Error(
+          "More than one SRT matched " + language + ": " +
+          languageFiles[key] + " and " + name
+        );
+      }
+
+      languageFiles[key] = name;
       srtFiles.push({
         file,
         srclang: language,
         label: language,
         kind: "subtitles",
-        default: index === 0,
+        default:
+          language.toLowerCase() ===
+          String(CONFIG.MASTER_LANGUAGE || "en").toLowerCase(),
         status: "published"
       });
     });
 
+    if (images.length > 1) {
+      throw new Error(
+        "More than one thumbnail JPG/PNG was found: " +
+        images.map(asset => asset.file.getName()).join(", ")
+      );
+    }
+
     return { images, srtFiles };
   }
 
-  function inferImageVariant_(name) {
-    const lower = name.toLowerCase();
-
-    if (/ultra[-_ ]?wide/.test(lower)) return "ultra-wide";
-    if (/thumbnail|thumb/.test(lower)) return "thumbnail";
-    if (/portrait/.test(lower)) return "portrait";
-    if (/square/.test(lower)) return "square";
-    if (/wide/.test(lower)) return "wide";
-    return "poster";
-  }
-
-  function inferLanguage_(name) {
+  function matchLanguageFromFilename_(name, allowedLanguages) {
     const stem = name.replace(/\.srt$/i, "");
-    const match = stem.match(
-      /(?:^|[._ -])([a-z]{2}(?:-[A-Z]{2})?)(?:$|[._ -])/i
+    const sorted = allowedLanguages.slice().sort(
+      (a, b) => b.length - a.length
     );
 
-    if (match) return match[1];
+    for (const language of sorted) {
+      const escaped = escapeRegExp_(language);
+      const pattern = new RegExp(
+        "(^|[._ -])" + escaped + "($|[._ -])",
+        "i"
+      );
 
-    return CONFIG.MASTER_LANGUAGE || "en";
+      if (pattern.test(stem)) return language;
+    }
+
+    return null;
+  }
+
+  function preflightAssets_(imageAssets, srtAssets) {
+    if (imageAssets.length > 1) {
+      throw new Error("Only one thumbnail image may be ingested per run.");
+    }
+
+    imageAssets.forEach(asset => {
+      if (!asset || !asset.file) {
+        throw new Error("Each image requires a Google Drive file.");
+      }
+
+      const name = asset.file.getName();
+
+      if (!/thumbnail/i.test(name) || !/\.(jpg|png)$/i.test(name)) {
+        throw new Error(
+          "Image must contain 'thumbnail' and end in .jpg or .png: " + name
+        );
+      }
+
+      validateFileSize_(asset.file);
+    });
+
+    const seenLanguages = {};
+
+    srtAssets.forEach(asset => {
+      if (!asset || !asset.file || !/\.srt$/i.test(asset.file.getName())) {
+        throw new Error("Each subtitle asset must be an .srt Drive file.");
+      }
+
+      if (!asset.srclang) {
+        throw new Error("Each SRT requires a matched variant language.");
+      }
+
+      const key = String(asset.srclang).toLowerCase();
+
+      if (seenLanguages[key]) {
+        throw new Error("Duplicate SRT language: " + asset.srclang);
+      }
+
+      seenLanguages[key] = true;
+      validateFileSize_(asset.file);
+    });
+  }
+
+  function validateFileSize_(file) {
+    const size = file.getSize();
+
+    if (size <= 0) {
+      throw new Error("Drive file is empty: " + file.getName());
+    }
+
+    if (size > MAX_ASSET_BYTES) {
+      throw new Error(
+        "Drive file exceeds the safe 45 MB upload limit: " + file.getName()
+      );
+    }
   }
 
   function uploadFileToSource_(videoId, file) {
@@ -249,29 +400,48 @@ const BrightcoveIngest = (() => {
 
     if (!uploadInfo.signed_url || !uploadInfo.api_request_url) {
       throw new Error(
-        "Brightcove did not return upload URLs for " + sourceName + "."
+        "Brightcove did not return complete upload URLs for " + sourceName + "."
       );
     }
 
-    const response = UrlFetchApp.fetch(uploadInfo.signed_url, {
-      method: "put",
-      payload: file.getBlob().getBytes(),
-      muteHttpExceptions: true
-    });
-    const code = response.getResponseCode();
-
-    if (code < 200 || code >= 300) {
-      throw new Error(
-        "Temporary S3 upload failed for " + sourceName +
-        " (HTTP " + code + "): " + response.getContentText()
-      );
-    }
+    uploadToSignedUrl_(uploadInfo.signed_url, file);
 
     return uploadInfo.api_request_url;
   }
 
-  function request_(method, endpoint, payload) {
+  function uploadToSignedUrl_(signedUrl, file) {
+    const maxRetries = Math.min(Number(CONFIG.MAX_RETRIES) || 3, 3);
     let attempt = 0;
+
+    while (true) {
+      const response = UrlFetchApp.fetch(signedUrl, {
+        method: "put",
+        payload: file.getBlob().getBytes(),
+        muteHttpExceptions: true
+      });
+      const code = response.getResponseCode();
+
+      if (code >= 200 && code < 300) return;
+
+      if (
+        (code === 408 || code === 429 || code >= 500) &&
+        attempt < maxRetries
+      ) {
+        Utilities.sleep(retryDelay_(attempt++));
+        continue;
+      }
+
+      throw new Error(
+        "Temporary S3 upload failed for " + file.getName() +
+        " (HTTP " + code + "): " + response.getContentText()
+      );
+    }
+  }
+
+  function request_(method, endpoint, payload) {
+    const maxRetries = Number(CONFIG.MAX_RETRIES) || 3;
+    let attempt = 0;
+    let refreshedToken = false;
 
     while (true) {
       const options = {
@@ -296,15 +466,18 @@ const BrightcoveIngest = (() => {
         return body ? JSON.parse(body) : {};
       }
 
-      if (
-        (code === 429 || code >= 500) &&
-        attempt < CONFIG.MAX_RETRIES
-      ) {
-        const delay =
-          CONFIG.INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+      if (code === 401 && !refreshedToken) {
+        accessToken = null;
+        tokenExpiry = 0;
+        refreshedToken = true;
+        continue;
+      }
 
-        attempt++;
-        Utilities.sleep(delay);
+      if (
+        (code === 408 || code === 429 || code >= 500) &&
+        attempt < maxRetries
+      ) {
+        Utilities.sleep(retryDelay_(attempt++));
         continue;
       }
 
@@ -312,6 +485,14 @@ const BrightcoveIngest = (() => {
         "Brightcove Dynamic Ingest error (HTTP " + code + "): " + body
       );
     }
+  }
+
+  function retryDelay_(attempt) {
+    const initial = Number(CONFIG.INITIAL_RETRY_DELAY_MS) || 1000;
+    const exponential = initial * Math.pow(2, attempt);
+    const jitter = Math.floor(Math.random() * Math.max(100, initial / 2));
+
+    return exponential + jitter;
   }
 
   function getAccessToken_() {
@@ -338,6 +519,10 @@ const BrightcoveIngest = (() => {
 
     const token = JSON.parse(response.getContentText());
 
+    if (!token.access_token || !token.expires_in) {
+      throw new Error("Brightcove returned an invalid OAuth token response.");
+    }
+
     accessToken = token.access_token;
     tokenExpiry = now + Math.max(
       0,
@@ -358,38 +543,21 @@ const BrightcoveIngest = (() => {
     return Date.now() + "_" + safe;
   }
 
-  function validateImageAsset_(asset) {
-    const variants = [
-      "poster", "thumbnail", "portrait", "square", "wide", "ultra-wide"
-    ];
+  function addUnique_(items, value) {
+    const key = value.toLowerCase();
 
-    if (!asset || !asset.file) {
-      throw new Error("Each image requires a Google Drive file.");
-    }
-
-    if (variants.indexOf(asset.variant) === -1) {
-      throw new Error("Invalid Brightcove image variant: " + asset.variant);
+    if (!items.some(item => item.toLowerCase() === key)) {
+      items.push(value);
     }
   }
 
-  function validateSrtAsset_(asset) {
-    if (!asset || !asset.file) {
-      throw new Error("Each SRT requires a Google Drive file.");
-    }
-
-    if (!/\.srt$/i.test(asset.file.getName())) {
-      throw new Error("Expected an .srt file: " + asset.file.getName());
-    }
-
-    if (!asset.srclang) {
-      throw new Error("Each SRT requires srclang.");
-    }
+  function escapeRegExp_(value) {
+    return String(value).replace(/[.*+?^$()|[\]\\]/g, "\\$&");
   }
 
   return {
     ingestAssetsForRow,
-    ingestSrtAndImages,
-    uploadImagesToVideo,
-    uploadSrtToVideo
+    dryRunAssetsForRow,
+    ingestSrtAndImages
   };
 })();
