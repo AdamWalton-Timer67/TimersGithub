@@ -1,14 +1,13 @@
 /**
  * BrightcoveIngest.gs
  *
- * Home for Brightcove image and subtitle ingestion.
- *
- * Planned implementation:
- * - Source Upload API
- * - Dynamic Ingest API
- * - Google Drive asset upload
- * - Image ingestion
- * - Native SRT ingestion
+ * Brightcove Dynamic Ingest module scaffold.
+ * Future commits will implement:
+ *  - Source Upload API
+ *  - Dynamic Ingest API
+ *  - Google Drive uploads
+ *  - Image ingestion
+ *  - Native SRT ingestion
  */
 
 function uploadImagesToVideo(videoId, imageFiles) {
