@@ -10,9 +10,65 @@
 const BrightcoveIngest = (() => {
   const INGEST_BASE_URL =
     "https://ingest.api.brightcove.com/v1/accounts/";
+  const DRIVE_LINK_COLUMN = 12; // Column L
 
   let accessToken = null;
   let tokenExpiry = 0;
+
+  /**
+   * Reads the video ID and Drive link from one row of the original sheet.
+   *
+   * Column L may contain a Drive folder link or a direct Drive file link.
+   * The Brightcove video ID is read from CONFIG.COLUMN_VIDEO_ID.
+   *
+   * Folder filename conventions:
+   * - poster.jpg, thumbnail.png, square.jpg, wide.jpg, etc.
+   * - captions_en.srt, captions_fr.srt, captions_en-GB.srt, etc.
+   */
+  function ingestAssetsForRow(rowNumber, options = {}) {
+    if (!Number.isInteger(rowNumber) || rowNumber <= CONFIG.HEADER_ROW) {
+      throw new Error("A valid data row number is required.");
+    }
+
+    const sheet = SpreadsheetApp
+      .getActiveSpreadsheet()
+      .getSheetByName(CONFIG.MAIN_SHEET_NAME);
+
+    if (!sheet) {
+      throw new Error("Main sheet not found.");
+    }
+
+    const videoId = String(
+      sheet.getRange(rowNumber, CONFIG.COLUMN_VIDEO_ID).getDisplayValue()
+    ).trim();
+    const driveLink = String(
+      sheet.getRange(rowNumber, DRIVE_LINK_COLUMN).getDisplayValue()
+    ).trim();
+
+    if (!videoId) {
+      throw new Error("Missing Brightcove video ID on row " + rowNumber + ".");
+    }
+
+    if (!driveLink) {
+      throw new Error("Missing Google Drive link in column L on row " + rowNumber + ".");
+    }
+
+    const files = getFilesFromDriveLink_(driveLink);
+    const assets = buildAssets_(files);
+
+    if (options.dryRun) {
+      return {
+        row: rowNumber,
+        videoId,
+        driveLink,
+        images: assets.images.map(asset => asset.file.getName()),
+        srtFiles: assets.srtFiles.map(asset => asset.file.getName()),
+        dryRun: true
+      };
+    }
+
+    return ingestSrtAndImages(videoId, assets.images, assets.srtFiles);
+  }
 
   /**
    * imageAssets:
@@ -56,7 +112,7 @@ const BrightcoveIngest = (() => {
     });
 
     if (!images.length && !textTracks.length) {
-      throw new Error("At least one image or SRT asset is required.");
+      throw new Error("No supported images or SRT files were found.");
     }
 
     const payload = {};
@@ -78,6 +134,111 @@ const BrightcoveIngest = (() => {
     return ingestSrtAndImages(videoId, [], srtAssets);
   }
 
+  function getFilesFromDriveLink_(driveLink) {
+    const id = extractDriveId_(driveLink);
+    const files = [];
+
+    if (/\/folders\//i.test(driveLink)) {
+      const iterator = DriveApp.getFolderById(id).getFiles();
+
+      while (iterator.hasNext()) {
+        files.push(iterator.next());
+      }
+
+      return files;
+    }
+
+    try {
+      files.push(DriveApp.getFileById(id));
+      return files;
+    } catch (fileError) {
+      const iterator = DriveApp.getFolderById(id).getFiles();
+
+      while (iterator.hasNext()) {
+        files.push(iterator.next());
+      }
+
+      return files;
+    }
+  }
+
+  function extractDriveId_(driveLink) {
+    const value = String(driveLink || "").trim();
+    const patterns = [
+      /\/folders\/([A-Za-z0-9_-]+)/i,
+      /\/d\/([A-Za-z0-9_-]+)/i,
+      /[?&]id=([A-Za-z0-9_-]+)/i,
+      /^([A-Za-z0-9_-]+)$/
+    ];
+
+    for (const pattern of patterns) {
+      const match = value.match(pattern);
+      if (match) return match[1];
+    }
+
+    throw new Error("Column L does not contain a recognised Google Drive link.");
+  }
+
+  function buildAssets_(files) {
+    const images = [];
+    const srtFiles = [];
+    const srtCandidates = [];
+
+    for (const file of files) {
+      const name = file.getName();
+      const mimeType = file.getMimeType();
+
+      if (
+        /^image\//i.test(mimeType) ||
+        /\.(jpe?g|png|gif)$/i.test(name)
+      ) {
+        images.push({
+          file,
+          variant: inferImageVariant_(name)
+        });
+      } else if (/\.srt$/i.test(name)) {
+        srtCandidates.push(file);
+      }
+    }
+
+    srtCandidates.forEach((file, index) => {
+      const language = inferLanguage_(file.getName());
+
+      srtFiles.push({
+        file,
+        srclang: language,
+        label: language,
+        kind: "subtitles",
+        default: index === 0,
+        status: "published"
+      });
+    });
+
+    return { images, srtFiles };
+  }
+
+  function inferImageVariant_(name) {
+    const lower = name.toLowerCase();
+
+    if (/ultra[-_ ]?wide/.test(lower)) return "ultra-wide";
+    if (/thumbnail|thumb/.test(lower)) return "thumbnail";
+    if (/portrait/.test(lower)) return "portrait";
+    if (/square/.test(lower)) return "square";
+    if (/wide/.test(lower)) return "wide";
+    return "poster";
+  }
+
+  function inferLanguage_(name) {
+    const stem = name.replace(/\.srt$/i, "");
+    const match = stem.match(
+      /(?:^|[._ -])([a-z]{2}(?:-[A-Z]{2})?)(?:$|[._ -])/i
+    );
+
+    if (match) return match[1];
+
+    return CONFIG.MASTER_LANGUAGE || "en";
+  }
+
   function uploadFileToSource_(videoId, file) {
     const sourceName = safeSourceName_(file.getName());
     const uploadInfo = request_(
@@ -97,7 +258,6 @@ const BrightcoveIngest = (() => {
       payload: file.getBlob().getBytes(),
       muteHttpExceptions: true
     });
-
     const code = response.getResponseCode();
 
     if (code < 200 || code >= 300) {
@@ -123,9 +283,7 @@ const BrightcoveIngest = (() => {
         }
       };
 
-      if (payload != null) {
-        options.payload = JSON.stringify(payload);
-      }
+      if (payload != null) options.payload = JSON.stringify(payload);
 
       const response = UrlFetchApp.fetch(
         INGEST_BASE_URL + CONFIG.ACCOUNT_ID + endpoint,
@@ -159,9 +317,7 @@ const BrightcoveIngest = (() => {
   function getAccessToken_() {
     const now = Date.now();
 
-    if (accessToken && now < tokenExpiry) {
-      return accessToken;
-    }
+    if (accessToken && now < tokenExpiry) return accessToken;
 
     const auth = Utilities.base64Encode(
       CONFIG.CLIENT_ID + ":" + CONFIG.CLIENT_SECRET
@@ -169,12 +325,8 @@ const BrightcoveIngest = (() => {
     const response = UrlFetchApp.fetch(CONFIG.OAUTH_URL, {
       method: "post",
       muteHttpExceptions: true,
-      headers: {
-        Authorization: "Basic " + auth
-      },
-      payload: {
-        grant_type: "client_credentials"
-      }
+      headers: { Authorization: "Basic " + auth },
+      payload: { grant_type: "client_credentials" }
     });
 
     if (response.getResponseCode() !== 200) {
@@ -201,21 +353,14 @@ const BrightcoveIngest = (() => {
       .replace(/[^A-Za-z0-9._-]+/g, "_")
       .replace(/^_+|_+$/g, "");
 
-    if (!safe) {
-      throw new Error("The source file has no usable filename.");
-    }
+    if (!safe) throw new Error("The source file has no usable filename.");
 
     return Date.now() + "_" + safe;
   }
 
   function validateImageAsset_(asset) {
     const variants = [
-      "poster",
-      "thumbnail",
-      "portrait",
-      "square",
-      "wide",
-      "ultra-wide"
+      "poster", "thumbnail", "portrait", "square", "wide", "ultra-wide"
     ];
 
     if (!asset || !asset.file) {
@@ -242,6 +387,7 @@ const BrightcoveIngest = (() => {
   }
 
   return {
+    ingestAssetsForRow,
     ingestSrtAndImages,
     uploadImagesToVideo,
     uploadSrtToVideo
