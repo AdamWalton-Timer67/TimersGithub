@@ -21,8 +21,20 @@ function onOpen() {
     )
 
     .addItem(
-      "Dry Run",
+      "Dry Run Metadata",
       "dryRunMetadata"
+    )
+
+    .addSeparator()
+
+    .addItem(
+      "Ingest Assets For Selected Row",
+      "ingestAssetsForSelectedRow"
+    )
+
+    .addItem(
+      "Dry Run Assets For Selected Row",
+      "dryRunAssetsForSelectedRow"
     )
 
     .addSeparator()
@@ -42,7 +54,8 @@ function onOpen() {
 }
 
 /**
- * Executes a normal synchronisation.
+ * Executes a normal metadata synchronisation.
+ * Asset ingest is deliberately not part of this operation.
  */
 function syncBrightcoveMetadata() {
 
@@ -55,7 +68,7 @@ function syncBrightcoveMetadata() {
 }
 
 /**
- * Executes a dry run.
+ * Executes a metadata-only dry run.
  */
 function dryRunMetadata() {
 
@@ -64,6 +77,89 @@ function dryRunMetadata() {
     dryRun: true
 
   });
+
+}
+
+/**
+ * Runs image/SRT ingest only for the currently selected sheet row.
+ */
+function ingestAssetsForSelectedRow() {
+
+  runAssetIngestForSelectedRow_(false);
+
+}
+
+/**
+ * Validates image/SRT ingest for the selected row without any writes.
+ */
+function dryRunAssetsForSelectedRow() {
+
+  runAssetIngestForSelectedRow_(true);
+
+}
+
+function runAssetIngestForSelectedRow_(dryRun) {
+
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+
+    const sheet = SpreadsheetApp
+      .getActiveSpreadsheet()
+      .getActiveSheet();
+
+    if (
+      !sheet ||
+      sheet.getName() !== CONFIG.MAIN_SHEET_NAME
+    ) {
+
+      throw new Error(
+        "Select a row in the " +
+        CONFIG.MAIN_SHEET_NAME +
+        " sheet first."
+      );
+
+    }
+
+    const rowNumber = sheet
+      .getActiveRange()
+      .getRow();
+
+    if (rowNumber <= CONFIG.HEADER_ROW) {
+
+      throw new Error(
+        "Select a video data row, not the header."
+      );
+
+    }
+
+    const result = dryRun
+      ? BrightcoveIngest.dryRunAssetsForRow(rowNumber)
+      : BrightcoveIngest.ingestAssetsForRow(rowNumber);
+
+    ui.alert(
+      dryRun
+        ? "Asset dry run passed"
+        : "Asset ingest submitted",
+      JSON.stringify(result, null, 2),
+      ui.ButtonSet.OK
+    );
+
+  }
+
+  catch (error) {
+
+    Log.exception(error);
+
+    ui.alert(
+      dryRun
+        ? "Asset dry run failed"
+        : "Asset ingest failed",
+      error.message,
+      ui.ButtonSet.OK
+    );
+
+  }
 
 }
 
